@@ -7,6 +7,7 @@ use std::{
     panic::catch_unwind,
     ptr::{self, NonNull},
     sync::{Arc, Condvar, Mutex, Weak},
+    time::Duration,
 };
 
 use jni::{objects::JObject, refs::Global, vm::AttachConfig};
@@ -384,8 +385,33 @@ impl WaitableNativeActivityState {
 
         unsafe {
             guard.write_cmd(AppCmd::Destroy);
-            while guard.thread_state != NativeThreadState::Stopped {
-                guard = self.cond.wait(guard).unwrap();
+
+            // Normal path: the Rust thread processes AppCmd::Destroy via poll_events()
+            // and post_exec_cmd(Destroy) calls process::exit(0) immediately, which also
+            // kills this thread, so we never reach the timeout below.
+            //
+            // Fallback: if ALooper_pollOnce never delivers the Destroy command (e.g.,
+            // the Rust thread is stuck in a blocking call unrelated to the looper), we
+            // time out here and force-exit to prevent an ANR.
+            let timeout = Duration::from_secs(3);
+            let mut remaining = timeout;
+            loop {
+                if guard.thread_state == NativeThreadState::Stopped {
+                    break;
+                }
+                let start = std::time::Instant::now();
+                let (g, timed_out) = self.cond.wait_timeout(guard, remaining).unwrap();
+                guard = g;
+                if timed_out.timed_out() {
+                    log::warn!(
+                        "notify_destroyed: Rust thread did not stop within {:?}, \
+                         forcing process exit to prevent ANR",
+                        timeout
+                    );
+                    std::process::exit(0);
+                }
+                let elapsed = start.elapsed();
+                remaining = remaining.saturating_sub(elapsed);
             }
 
             libc::close(guard.msg_read);
