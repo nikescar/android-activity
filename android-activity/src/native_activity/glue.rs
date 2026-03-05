@@ -386,13 +386,13 @@ impl WaitableNativeActivityState {
         unsafe {
             guard.write_cmd(AppCmd::Destroy);
 
-            // Wait for the Rust thread to stop, with a timeout to prevent an ANR.
+            // Normal path: the Rust thread processes AppCmd::Destroy via poll_events()
+            // and post_exec_cmd(Destroy) calls process::exit(0) immediately, which also
+            // kills this thread, so we never reach the timeout below.
             //
-            // If the Rust event loop doesn't process the Destroy command and exit
-            // within the timeout (e.g., when eframe is stuck in the suspended state
-            // with no native window), we force-exit the process. This avoids the
-            // ANR that would otherwise occur when Android's Activity.onDestroy()
-            // blocks indefinitely waiting for the Rust thread.
+            // Fallback: if ALooper_pollOnce never delivers the Destroy command (e.g.,
+            // the Rust thread is stuck in a blocking call unrelated to the looper), we
+            // time out here and force-exit to prevent an ANR.
             let timeout = Duration::from_secs(3);
             let mut remaining = timeout;
             loop {
@@ -656,6 +656,18 @@ impl WaitableNativeActivityState {
                 let mut guard = self.mutex.lock().unwrap();
                 guard.app_has_saved_state = true;
                 self.cond.notify_one();
+            }
+            AppCmd::Destroy => {
+                // The event loop should have exited after receiving MainEvent::Destroy, causing
+                // android_main() to return and unblock notify_destroyed(). However, winit <= 0.30
+                // ignores MainEvent::Destroy (known TODO). Since the app state was already saved
+                // during the preceding Suspended/TermWindow event, we exit immediately here to
+                // allow Android to recreate the activity without an ANR delay.
+                log::warn!(
+                    "post_exec_cmd(Destroy): event loop did not exit; \
+                     forcing process exit to allow activity recreation"
+                );
+                std::process::exit(0);
             }
             _ => {}
         }
