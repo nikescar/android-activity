@@ -7,6 +7,7 @@ use std::{
     panic::catch_unwind,
     ptr::{self, NonNull},
     sync::{Arc, Condvar, Mutex, Weak},
+    time::Duration,
 };
 
 use jni::{objects::JObject, refs::Global, vm::AttachConfig};
@@ -384,8 +385,33 @@ impl WaitableNativeActivityState {
 
         unsafe {
             guard.write_cmd(AppCmd::Destroy);
-            while guard.thread_state != NativeThreadState::Stopped {
-                guard = self.cond.wait(guard).unwrap();
+
+            // Wait for the Rust thread to stop, with a timeout to prevent an ANR.
+            //
+            // If the Rust event loop doesn't process the Destroy command and exit
+            // within the timeout (e.g., when eframe is stuck in the suspended state
+            // with no native window), we force-exit the process. This avoids the
+            // ANR that would otherwise occur when Android's Activity.onDestroy()
+            // blocks indefinitely waiting for the Rust thread.
+            let timeout = Duration::from_secs(3);
+            let mut remaining = timeout;
+            loop {
+                if guard.thread_state == NativeThreadState::Stopped {
+                    break;
+                }
+                let start = std::time::Instant::now();
+                let (g, timed_out) = self.cond.wait_timeout(guard, remaining).unwrap();
+                guard = g;
+                if timed_out.timed_out() {
+                    log::warn!(
+                        "notify_destroyed: Rust thread did not stop within {:?}, \
+                         forcing process exit to prevent ANR",
+                        timeout
+                    );
+                    std::process::exit(0);
+                }
+                let elapsed = start.elapsed();
+                remaining = remaining.saturating_sub(elapsed);
             }
 
             libc::close(guard.msg_read);
